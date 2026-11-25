@@ -57,6 +57,38 @@ STYLE_PRESETS = {
                   "and cinematic composition. Keep characters and materials consistent. No text, no logos, no watermarks."),
         "motion": " Tactile frame-by-frame stop-motion movement, slight handmade imperfections, expressive clay poses.",
     },
+    "chalkboard": {
+        "label": "Chalkboard drawings",
+        "image_type": "2d",
+        "style": ("Hand-drawn chalk illustration on a dark green classroom chalkboard, powdery chalk grain, slightly "
+                  "imperfect white and muted-color strokes, simple expressive sketches and diagram shapes, soft chalk "
+                  "dust and warm classroom light. Keep drawings clear and consistent. No readable text, no logos, no watermarks."),
+        "motion": " Gentle chalk-drawn animation: lines appear and refine into simple sketches, with subtle board-level camera moves.",
+    },
+    "whiteboard": {
+        "label": "Whiteboard drawings",
+        "image_type": "2d",
+        "style": ("Clean hand-drawn whiteboard illustration, fine dry-erase marker lines, simple expressive characters "
+                  "and diagram shapes, mostly black outlines with restrained bright accent colors, clean white surface "
+                  "and soft studio lighting. Keep drawings clear and consistent. No readable text, no logos, no watermarks."),
+        "motion": " Smooth marker-doodle animation: simple lines and shapes draw on cleanly, with gentle camera moves and no legible writing.",
+    },
+    "paper_cutout": {
+        "label": "Paper cutout",
+        "image_type": "2d",
+        "style": ("Hand-crafted layered paper-cut illustration, visible paper fibers and softly uneven cut edges, "
+                  "overlapping colored paper shapes with delicate cast shadows, tactile handmade texture and clear "
+                  "silhouettes. Keep characters and paper layers consistent. No text, no logos, no watermarks."),
+        "motion": " Tactile cut-paper stop-motion: layered shapes slide and tilt independently with gentle parallax and handmade timing.",
+    },
+    "comic_book": {
+        "label": "Comic book",
+        "image_type": "2d",
+        "style": ("Vivid comic-book illustration with confident black ink outlines, expressive poses, selective crosshatching "
+                  "and halftone texture, dramatic light and bold but controlled colors. Use dynamic sequential-art "
+                  "composition without speech bubbles or lettering. No text, no logos, no watermarks."),
+        "motion": " Dynamic but readable comic-book animation with inked pose changes, subtle parallax, and restrained speed lines; no lettering.",
+    },
 }
 
 CLOTHING_LOCK = " Garment cut, fabric, colors, footwear and accessories remain unchanged throughout the shot."

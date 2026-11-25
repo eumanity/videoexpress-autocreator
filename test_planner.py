@@ -92,7 +92,7 @@ class ExportPartitionTests(unittest.TestCase):
             planner.partition_narration_exports([{"duration": 601}], [{"n": 1, "part": 1}])
 
     def test_new_visual_styles_are_complete_presets(self):
-        for key in ("stickman", "claymation"):
+        for key in ("stickman", "claymation", "chalkboard", "whiteboard", "paper_cutout", "comic_book"):
             with self.subTest(key=key):
                 self.assertTrue(brain.STYLE_PRESETS[key]["label"])
                 self.assertTrue(brain.STYLE_PRESETS[key]["style"])
