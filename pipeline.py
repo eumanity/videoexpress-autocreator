@@ -15,7 +15,8 @@ from . import voices as VO
 from . import sound as SND
 from .brain import (Brain, BrainError, build_image_prompt, build_video_prompt, normalise_analysis, normalise_sound,
                     parse_scene_reply, _extract_json)
-from .project import HOME, Project, load_settings, save_settings
+from .project import (HOME, MAX_EXPORT_SEGMENT_SECONDS, MAX_VIDEO_CLIP_SECONDS, MAX_VIDEO_SECONDS, Project, load_settings,
+                      save_settings)
 from .ve import Stop, VEError, VideoExpress, download
 
 def _brain(s: dict) -> Brain:
@@ -121,12 +122,26 @@ class Runner:
 
     async def browser(self) -> VideoExpress:
         s = load_settings()
-        if self.ve and self.ve.page and not self.ve.page.is_closed():
+        if self.ve and self.ve.ready and self.ve.page and not self.ve.page.is_closed():
             self.ve.s = s
             return self.ve
+        if self.ve:
+            try:
+                await self.ve.stop()
+            except Exception as e:
+                self.log(f"Could not close the incomplete VideoExpress browser session: {e}")
+            self.ve = None
         self.ve = VideoExpress(s, HOME / "browser-profile", self.log, self.ask, lambda: self._stop)
         self.log("Opening VideoExpress…")
-        await self.ve.start()
+        try:
+            await self.ve.start()
+        except Exception:
+            try:
+                await self.ve.stop()
+            except Exception:
+                pass
+            self.ve = None
+            raise
         return self.ve
 
 
@@ -176,16 +191,21 @@ async def step_analyse(p: Project):
     s = load_settings()
     script = P.clean_script(p.state["script"])
     p.state["clean_script"] = script
-    parts = P.chunk_for_tts(script, int(s["tts_limit"]))
+    est = P.estimate_seconds(script, float(s["wpm"]))
+    if est > MAX_VIDEO_SECONDS:
+        raise VEError(f"This script is about {est / 60:.1f} minutes; the maximum video length is 18 minutes. "
+                      "Shorten the script before generating narration.")
+    tts_limit = int(s["tts_limit"])
+    tts_soft = 2200
+    if est > MAX_EXPORT_SEGMENT_SECONDS:
+        tts_limit = min(tts_limit, 1800)
+        tts_soft = min(tts_soft, 1600, tts_limit)
+    parts = P.chunk_for_tts(script, tts_limit, tts_soft)
     if not p.state.get("parts") or not any(x.get("audio") for x in p.state["parts"]):
         p.state["parts"] = [{"k": i + 1, "text": t} for i, t in enumerate(parts)]
-    est = P.estimate_seconds(script, float(s["wpm"]))
     p.state["estimate_s"] = round(est)
     RUN.log(f"Script: {len(P.sentences(script))} sentences, {len(parts)} narration parts, "
             f"about {est / 60:.1f} min of narration.")
-    if est > float(s["export_cap_seconds"]):
-        RUN.log(f"⚠ That is longer than the {int(s['export_cap_seconds']) // 60}-minute export limit. "
-                f"Shorten the script or split it into two projects.")
     brain = _brain(s)
     if brain.provider == "manual":
         sys_, task = brain.analysis_prompt(script, p.state["preset"])
@@ -280,6 +300,9 @@ async def step_narrate(p: Project):
             RUN.log(f"  part {part['k']}: {m['dur']:.1f}s, {len(m['pauses'])} pauses")
         RUN.progress["done"] = sum(1 for x in parts if x.get("audio"))
     total = sum(x["duration"] for x in parts)
+    if total > MAX_VIDEO_SECONDS:
+        raise VEError(f"The narration is {total / 60:.1f} minutes; the maximum video length is 18 minutes. "
+                      "Shorten the script and regenerate the narration.")
     p.state["narration_s"] = round(total, 2)
     RUN.log(f"Narration total {total / 60:.2f} min.")
     set_stage(p, "narrated")
@@ -345,6 +368,28 @@ async def step_prompts(p: Project):
     RUN.log("All prompts written. Review/edit them in the Scenes tab, then press Render.")
 
 
+async def step_rewrite_scene_prompt(p: Project, scene_n: int, feedback: str = ""):
+    scene = next((sc for sc in p.state.get("scenes", []) if sc["n"] == scene_n), None)
+    if scene is None:
+        raise ValueError(f"Scene {scene_n} was not found.")
+    if scene.get("continue") and is_dialogue(p):
+        raise ValueError("This scene continues from the previous clip and does not use a new image prompt.")
+    brain = _brain(load_settings())
+    prompt = await asyncio.to_thread(
+        brain.rewrite_scene_prompt, p.state.get("analysis") or {}, scene, feedback, RUN.log
+    )
+    scene["image"] = prompt
+    scene.update(status="pending", tries=0)
+    for key in ("img", "img_ok", "frame", "ref", "lib_id", "fileName", "preview",
+                "video_url", "dur_ms", "error", "submitted"):
+        scene.pop(key, None)
+    p.state.pop("export", None)
+    if stage_at_least(p, "rendered"):
+        p.state["stage"] = "prompted"
+    p.save()
+    RUN.log(f"Scene {scene_n} prompt rewritten. Review it in the Scenes tab, then press Render.")
+
+
 # ============================================================ dialogue movies
 def _keys(p: Project) -> set[str]:
     return {t["key"] for t in (p.state.get("analysis") or {}).get("tokens", [])}
@@ -364,6 +409,9 @@ def _store_shots(p: Project, shots: list[dict]):
     shots = SP.fix_continuity(SP.split_long_lines(shots))
     p.state["scenes"] = SP.to_scenes(shots, p.state["analysis"])
     SP.time_scenes(p.state["scenes"])
+    duration = sum(float(sc.get("len") or 0) for sc in p.state["scenes"])
+    if duration > MAX_VIDEO_SECONDS:
+        raise VEError(f"The screenplay is about {duration / 60:.1f} minutes; the maximum video length is 18 minutes.")
     p.save()
 
 
@@ -464,6 +512,9 @@ async def dlg_voices(p: Project):
 def dlg_timing(p: Project) -> str:
     s = load_settings()
     SP.time_scenes(p.state["scenes"])
+    duration = sum(float(sc.get("len") or 0) for sc in p.state["scenes"])
+    if duration > MAX_VIDEO_SECONDS:
+        raise VEError(f"The screenplay is about {duration / 60:.1f} minutes; the maximum video length is 18 minutes.")
     n = len(p.state["scenes"])
     p.state["budget_ok"] = p.state.get("budget_ok") or n <= int(s["max_clips"])
     set_stage(p, "planned")
@@ -485,6 +536,17 @@ async def step_render(p: Project):
     s = load_settings()
     if not stage_at_least(p, "prompted"):
         raise VEError("Write the scene prompts first.")
+    scenes, split_count = P.split_overlong_scenes(
+        p.state.get("scenes", []), MAX_VIDEO_CLIP_SECONDS
+    )
+    if split_count:
+        p.state["scenes"] = scenes
+        p.state["budget_ok"] = len(scenes) <= int(s["max_clips"])
+        p.save()
+        RUN.log(
+            f"Split {split_count} legacy scene(s) over {MAX_VIDEO_CLIP_SECONDS}s into "
+            f"VideoExpress-compatible clips; existing completed clips were kept."
+        )
     if not p.state.get("budget_ok"):
         raise VEError("Approve the budget first (Scenes tab).")
     ve = await RUN.browser()
@@ -495,7 +557,7 @@ async def step_render(p: Project):
     retries = int(s["image_retries"])
     limit = max(1, int(s.get("max_parallel", 5)))
     image_type = s.get("image_type", "")
-    RUN.progress = {"done": 0, "total": len(scenes), "label": "Scenes rendered"}
+    RUN.progress = {"done": 0, "total": len(scenes), "label": "Preparing scenes"}
     last = {"poll": 0.0, "wait_log": 0.0}
 
     async def poll(force=False):
@@ -521,6 +583,8 @@ async def step_render(p: Project):
                     RUN.log(f"Scene {sc['n']} took over 45 min; will retry.")
             p.save()
         RUN.progress["done"] = sum(1 for x in scenes if x["status"] == "done")
+        active = sum(1 for x in scenes if x["status"] == "rendering")
+        RUN.progress["label"] = f"{active} clips rendering" if active else "Scenes complete"
 
     async def free_slot():
         while True:
@@ -570,11 +634,13 @@ async def step_render(p: Project):
 
     async def submit(sc):
         sc["tries"] += 1
+        RUN.progress["label"] = f"Scene {sc['n']}/{len(scenes)} · generating keyframe"
         kind = "line" if sc.get("line") and sc.get("speaker") not in ("", "NARRATOR") else "silent"
         RUN.log(f"Scene {sc['n']}/{len(scenes)} ({sc['len']}s{', continues' if sc.get('continue') and dialogue else ''}"
                 f"{', talking' if kind == 'line' else ''}): start frame…")
         try:
             src = await start_frame(sc)
+            RUN.progress["label"] = f"Scene {sc['n']}/{len(scenes)} · submitting clip"
             await free_slot()
             if dialogue:
                 prompt = SP.shot_video_prompt(sc, a, preset, P.expand, voice_mode)
@@ -586,10 +652,13 @@ async def step_render(p: Project):
                 sc["ref"] = await ve.clip(src, build_video_prompt(sc, a, preset, P.expand, P.shots_text), sc["len"])
             sc.update(status="rendering", submitted=time.time())
             sc.pop("error", None)
+            active = sum(1 for x in scenes if x["status"] == "rendering")
+            RUN.progress["label"] = f"{active} clips rendering"
             RUN.log(f"  submitted clip ({sc['ref']})")
         except VEError as e:
             sc["status"] = "failed"
             sc["error"] = str(e)
+            RUN.progress["label"] = f"Scene {sc['n']}/{len(scenes)} failed; see log"
             if "KEYFRAME_MISSING" in str(e):
                 sc["img_ok"] = False          # the old keyframe is gone from the dialog: make a new one next time
             RUN.log(f"  scene {sc['n']} problem: {e}")
@@ -618,6 +687,94 @@ async def step_render(p: Project):
     RUN.log("Every clip is rendered.")
 
 
+async def _assemble_long_video(p: Project, ve: VideoExpress, name: str, ex: dict):
+    segment_limit = MAX_EXPORT_SEGMENT_SECONDS - 10
+    dialogue = is_dialogue(p)
+    try:
+        if dialogue:
+            groups = P.partition_scene_exports(p.state["scenes"], segment_limit)
+        else:
+            groups = P.partition_narration_exports(p.state["parts"], p.state["scenes"], segment_limit)
+    except ValueError as e:
+        raise VEError(str(e)) from e
+    if len(groups) < 2:
+        raise VEError("This video cannot be divided into exports under 10 minutes. Re-plan the narration into "
+                      "shorter parts and try again.")
+
+    segments = ex.get("segments") or []
+    same_plan = len(segments) == len(groups) and all(
+        old.get("scene_numbers") == new.get("scene_numbers")
+        and old.get("part_start") == new.get("part_start")
+        and old.get("part_end") == new.get("part_end")
+        for old, new in zip(segments, groups)
+    )
+    if not same_plan:
+        segments = []
+        for i, group in enumerate(groups, 1):
+            part_name = f"{_safe(name)[:42]} - Part {i} of {len(groups)}"
+            segments.append({**group, "name": part_name})
+        ex["segments"] = segments
+        p.state["export"] = ex
+        p.save()
+
+    for i, segment in enumerate(segments, 1):
+        await ve.check_stop()
+        segment_path = Path(segment.get("file") or "")
+        if segment.get("file") and segment_path.is_file():
+            continue
+        if not segment.get("url"):
+            await ve.close_dialog()
+            copy = await ve.ensure_blank()
+            if copy:
+                RUN.log(f"The editor had unsaved work - it was saved as '{copy}' before starting the next segment.")
+            scenes = [sc for sc in p.state["scenes"] if sc["n"] in segment["scene_numbers"]]
+            items = [{"id": sc["lib_id"], "fileName": sc.get("fileName", "")} for sc in scenes]
+            RUN.log(f"Exporting segment {i}/{len(segments)} ({segment['duration_s'] / 60:.1f} min)…")
+            RUN.progress = {"done": 0, "total": len(items), "label": f"Segment {i}/{len(segments)} clips"}
+            await ve.add_clips(items, lambda d, t: RUN.progress.update(done=d))
+            rows = await ve.timeline()
+            bricks = sorted(rows[0], key=lambda b: b["left"])
+            if len(bricks) != len(scenes):
+                raise VEError(f"Segment {i}: expected {len(scenes)} video clips, found {len(bricks)}.")
+            first_len = (scenes[0].get("dur_ms") or scenes[0]["len"] * 1000) / 1000
+            pxs = bricks[0]["width"] / first_len
+            gaps = await ve.check_gaps()
+            if gaps:
+                raise VEError(f"Gaps in segment {i} at positions {gaps[:10]}")
+            if dialogue:
+                narr = [(sc["audio"]["id"], b["left"]) for sc, b in zip(scenes, bricks)
+                        if sc.get("speaker") == "NARRATOR" and sc.get("audio", {}).get("id")]
+                if narr:
+                    await ve.place_audio_at(narr)
+            else:
+                parts = p.state["parts"][segment["part_start"]:segment["part_end"]]
+                end_px = await ve.place_narration([part["audio"]["id"] for part in parts])
+                await ve.trim_video(end_px)
+            await ve.save_new(segment["name"])
+            result = await ve.export(segment["name"])
+            segment.update(result)
+            p.state["export"] = ex
+            p.save()
+        if not segment.get("file") or not Path(segment["file"]).is_file():
+            dest = p.dir / "exports" / f"segment-{i:02d}.mp4"
+            RUN.log(f"Downloading segment {i}/{len(segments)}…")
+            segment["file"] = str(await asyncio.to_thread(download, segment["url"], dest, RUN.log))
+            p.state["export"] = ex
+            p.save()
+
+    s = load_settings()
+    out = Path(s["download_dir"]).expanduser() / (_safe(name) + ".mp4")
+    out = _unique(out)
+    RUN.log("Joining the exported segments on this PC…")
+    final = await asyncio.to_thread(SND.concatenate, [Path(x["file"]) for x in segments], out, RUN.log)
+    ex["file"] = str(final)
+    ex["duration_s"] = round(SND.duration(final), 2)
+    ex["stitched"] = True
+    p.state["export"] = ex
+    set_stage(p, "exported")
+    RUN.log(f"✔ Joined video saved: {final}")
+
+
 async def step_assemble(p: Project):
     s = load_settings()
     if not stage_at_least(p, "rendered"):
@@ -626,6 +783,15 @@ async def step_assemble(p: Project):
     await ve.close_dialog()
     name = p.state.get("export_name") or p.state["name"]
     ex = p.state.get("export") or {}
+    duration_s = (sum(float(sc.get("len") or 0) for sc in p.state.get("scenes", []))
+                  if is_dialogue(p) else sum(float(part.get("duration") or 0) for part in p.state.get("parts", [])))
+    if duration_s > MAX_EXPORT_SEGMENT_SECONDS:
+        if ex.get("file") and Path(ex["file"]).is_file():
+            set_stage(p, "exported")
+            RUN.log(f"✔ Joined video already exists: {ex['file']}")
+            return
+        await _assemble_long_video(p, ve, name, ex)
+        return
     if not ex.get("url"):
         if not ex.get("saved"):
             RUN.log("Starting a new blank project in VideoExpress…")

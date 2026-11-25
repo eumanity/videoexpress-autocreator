@@ -8,3 +8,5 @@ settings.json
 browser-profile/
 projects/
 *.mp4
+build/
+dist/

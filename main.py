@@ -55,10 +55,14 @@ def main():
     from . import __version__
     from .project import KEYS_FILE, ensure_keys_file, load_settings
     url = f"http://127.0.0.1:{PORT}/"
+    open_window = os.environ.get("SCRIPTPILOT_NO_WINDOW") != "1"
     if _port_in_use(PORT):
         if _running_version(PORT) == __version__:
-            print("VideoExpress AutoCreator is already running - opening its window.")
-            _app_window(url)
+            if open_window:
+                print("VideoExpress AutoCreator is already running - opening its window.")
+                _app_window(url)
+            else:
+                print("VideoExpress AutoCreator is already running.")
             return
         print(f"An older VideoExpress AutoCreator is still running on port {PORT}. Close its black window (or restart the PC) and try again.")
         input("Press Enter to exit...")
@@ -70,7 +74,8 @@ def main():
     if not key_ok:
         print(f"  ! No key found for {s['provider']}. Add it to the keys file (or in Settings).")
     from .server import app
-    threading.Thread(target=lambda: (time.sleep(1.2), _app_window(url)), daemon=True).start()
+    if open_window:
+        threading.Thread(target=lambda: (time.sleep(1.2), _app_window(url)), daemon=True).start()
     print(f"Running at {url}  (keep this window open; close it to quit)")
     app.run(host="127.0.0.1", port=PORT, debug=False, use_reloader=False, threaded=True)
 

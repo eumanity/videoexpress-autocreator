@@ -87,14 +87,20 @@ class VideoExpress:
         self.log, self.ask, self.should_stop = log, ask, should_stop
         self.ctx = None
         self.page = None
+        self.ready = False
         self.folders: dict[str, int] = {}
         self._pw = None
         self._dumped_item = False
 
     # ================================================================ session
     async def start(self):
-        if self.page and not self.page.is_closed():
+        if self.ready and self.page and not self.page.is_closed():
             return
+        if self.ctx or self._pw:
+            try:
+                await self.stop()
+            except Exception as e:
+                self.log(f"Could not close the incomplete VideoExpress session: {e}")
         from playwright.async_api import async_playwright
         self._pw = await async_playwright().start()
         args = ["--disable-blink-features=AutomationControlled", "--start-maximized", "--mute-audio"]
@@ -109,8 +115,19 @@ class VideoExpress:
                 str(self.profile_dir), headless=False, args=args, no_viewport=True, accept_downloads=True)
         await self.ctx.add_init_script(HELPERS_JS)
         self.page = self.ctx.pages[0] if self.ctx.pages else await self.ctx.new_page()
-        await self.page.goto(self.s["ve_url"], wait_until="domcontentloaded")
+        for attempt in range(3):
+            try:
+                await self.page.goto(self.s["ve_url"], wait_until="domcontentloaded")
+                break
+            except Exception as e:
+                if attempt == 2:
+                    raise VEError(f"Could not load VideoExpress after 3 attempts: {e}") from e
+                self.log(
+                    f"VideoExpress navigation was interrupted (attempt {attempt + 1}/3); retrying."
+                )
+                await asyncio.sleep(attempt + 1)
         await self.ensure_editor()
+        self.ready = True
 
     async def ensure_editor(self):
         for attempt in range(3):
@@ -136,6 +153,7 @@ class VideoExpress:
             if self._pw:
                 await self._pw.stop()
             self.ctx = self.page = self._pw = None
+            self.ready = False
 
     async def check_stop(self):
         if self.should_stop():
@@ -245,11 +263,17 @@ class VideoExpress:
 
     # ======================================================== create dialog
     async def dialog(self):
-        if await self.page.evaluate("!!(window.__ve && __ve.dlg())"):
+        if await self.page.evaluate("""(() => {
+            const d=window.__ve&&__ve.dlg(), m=d&&d.closest('.bbm-modal');
+            return !!(m&&m.classList.contains('bbm-modal--open')&&m.offsetParent);
+        })()"""):
             return
         await self.rail("Create with AI")
-        await self.page.evaluate("(() => { const b=[...document.querySelectorAll('.button-generate-from-prompt')].find(e=>e.offsetParent); if(b) b.click(); })()")
-        await self.page.wait_for_selector("#opt_prompt", timeout=20000)
+        button = self.page.locator(".button-generate-from-prompt:visible")
+        if await button.count() == 0:
+            raise VEError("'Create Video From Prompt' button not found")
+        await button.last.click(timeout=10000)
+        await self.page.wait_for_selector("#opt_prompt", state="visible", timeout=20000)
         await asyncio.sleep(0.8)
         aspect = "Vertical" if self.s.get("aspect") == "vertical" else "Landscape"
         await self.page.evaluate("""a => { const d=__ve.dlg(); const b=[...d.querySelectorAll('button')].find(x=>x.innerText.trim().startsWith(a));
@@ -363,6 +387,15 @@ class VideoExpress:
         await self.dialog()
         return await self.page.evaluate("__ve.types()")
 
+    async def _click_button(self, name: str):
+        dialog = self.page.locator(".bbm-modal--open")
+        button = dialog.locator("button:visible").filter(has_text=name)
+        if await button.count() == 0:
+            raise VEError(f"VideoExpress' '{name}' button was not found.")
+        if not await button.is_enabled():
+            raise VEError(f"VideoExpress' '{name}' button is disabled.")
+        await button.click(timeout=10000)
+
     async def keyframe(self, prompt: str, image_type: str, timeout_s: int = 240) -> str:
         """Generate one keyframe in the Create dialog and return its image UUID."""
         await self.dialog()
@@ -372,9 +405,8 @@ class VideoExpress:
             __ve.setText('opt_prompt',p); return __ve.state(); }""", [image_type, prompt])
         if st.get("shared"):
             raise VEError("Could not switch off public sharing - stopping for safety")
-        btn = await self.page.evaluate("(() => { const b=__ve.button('Create Image'); if(b){b.click(); return true;} return false; })()")
-        if not btn:
-            raise VEError("'Create Image' button not found")
+        await self._click_button("Create Image")
+        self.log("Image request submitted to VideoExpress; waiting for its preview…")
         t0 = time.time()
         while time.time() - t0 < timeout_s:
             await self.sleep(3)
@@ -387,7 +419,8 @@ class VideoExpress:
             errs = await self.page.evaluate("__ve.errors()")
             if errs and any(re.search(r"error|fail|insufficient|credit|limit", e, re.I) for e in errs):
                 raise VEError("VideoExpress: " + " | ".join(errs))
-        raise VEError("Image generation timed out")
+        raise VEError(f"VideoExpress did not show a new image preview within {timeout_s} seconds. "
+                      "Check the VideoExpress window for an account, service, or generation error, then retry.")
 
     def preview_url(self, image_uuid: str) -> str:
         return f"https://user-assets.renderplatform.com/preview/{image_uuid}.jpg"
@@ -473,21 +506,32 @@ class VideoExpress:
             if not footer or uuid not in footer:
                 raise VEError(f"Wrong source image selected ({footer})")
 
-    async def _video_id(self, before: int, seconds: int | None = None) -> dict:
-        for _ in range(12):
-            await asyncio.sleep(1)
-            f = await self.page.evaluate("__ve.footer()")
-            if f and f.startswith("Video: "):
-                return {"uuid": f[7:]}
-        for _ in range(8):  # footer never showed the id: look in the library
+    async def _video_id(self, before: int, seconds: int | None = None, previous_footer: str = "") -> dict:
+        deadline = time.monotonic() + 120
+        last_media_check = 0.0
+        old_errors = set(await self.page.evaluate("__ve.errors()"))
+        while time.monotonic() < deadline:
             await asyncio.sleep(2)
-            new = [m for m in await self.media("my_ai_videos", 5) if m["id"] > before]
-            if seconds:
-                new = [m for m in new if str(m.get("name", "")).startswith(f"Total duration {int(seconds)}s")] or new
-            if new:
-                return {"lib": new[-1]["id"]}
-        errs = await self.page.evaluate("__ve.errors()")
-        raise VEError("Video was not accepted" + (": " + " | ".join(errs) if errs else ""))
+            footer = await self.page.evaluate("__ve.footer()")
+            if footer and footer.startswith("Video: ") and footer != previous_footer:
+                video_id = footer[7:].strip()
+                if re.fullmatch(UUID, video_id):
+                    return {"uuid": video_id}
+            if time.monotonic() - last_media_check >= 6:
+                last_media_check = time.monotonic()
+                new = [m for m in await self.media("my_ai_videos", 5) if m["id"] > before]
+                if seconds:
+                    new = [m for m in new if str(m.get("name", "")).startswith(
+                        f"Total duration {int(seconds)}s")] or new
+                if new:
+                    return {"lib": new[-1]["id"]}
+            errors = await self.page.evaluate("__ve.errors()")
+            fresh_errors = [e for e in errors if e not in old_errors]
+            if fresh_errors and any(re.search(r"error|fail|insufficient|credit|limit", e, re.I)
+                                    for e in fresh_errors):
+                raise VEError("VideoExpress: " + " | ".join(fresh_errors))
+        raise VEError("VideoExpress did not confirm the new clip within 120 seconds. "
+                      "Check its editor for an account, service, or generation error, then retry.")
 
     async def lipsync_clip(self, source: dict, prompt: str, audio_lib_id: int) -> dict:
         """Talking clip: the start frame is animated and lip-synced to OUR audio (a character's TTS line)."""
@@ -499,10 +543,11 @@ class VideoExpress:
             raise VEError(f"Lip-sync settings did not stick: {st}")
         top = await self.media("my_ai_videos", 3)
         before = top[0]["id"] if top else 0
-        ok = await self.page.evaluate("""(() => { const b=[...__ve.dlg().querySelectorAll('button.button-generate-talking-video')].find(e=>e.offsetParent);
-            if(!b) return false; b.click(); return true; })()""")
-        if not ok:
+        previous_footer = await self.page.evaluate("__ve.footer()")
+        button = self.page.locator("button.button-generate-talking-video:visible")
+        if await button.count() == 0:
             raise VEError("Lip-sync 'Create Video' button not found")
+        await button.click(timeout=10000)
         # audio modal → Import Audio tab → select our line → Create Narration Video
         r = await self.page.evaluate("""async () => { const vis=e=>!!e.offsetParent; const sleep=ms=>new Promise(r=>setTimeout(r,ms));
             let m=null; for(let i=0;i<20 && !m;i++){ await sleep(400); m=[...document.querySelectorAll('.bbm-modal--open')].find(x=>x.querySelector('#tab-third')); }
@@ -522,7 +567,7 @@ class VideoExpress:
             await self.page.evaluate("""(() => { const m=[...document.querySelectorAll('.bbm-modal--open')].find(x=>x.querySelector('#tab-third'));
                 if(m){ const c=[...m.querySelectorAll('button.button-close')].find(e=>e.offsetParent); c&&c.click(); } })()""")
             raise VEError(f"Lip-sync clip was not accepted: {r}")
-        return await self._video_id(before)
+        return await self._video_id(before, previous_footer=previous_footer)
 
     async def clip(self, source, prompt: str, seconds: int, with_sound: bool = False) -> dict:
         """Animate the start frame; returns {'uuid':..} or {'lib':id}. with_sound=True lets the video model
@@ -539,8 +584,10 @@ class VideoExpress:
             raise VEError(f"Video settings did not stick: {st}")
         top = await self.media("my_ai_videos", 3)
         before = top[0]["id"] if top else 0
-        await self.page.evaluate("__ve.button('Create Video').click()")
-        return await self._video_id(before, seconds)
+        previous_footer = await self.page.evaluate("__ve.footer()")
+        await self._click_button("Create Video")
+        self.log("Clip request submitted to VideoExpress; waiting for its video ID…")
+        return await self._video_id(before, seconds, previous_footer)
 
     async def close_dialog(self):
         await self.page.evaluate("""(() => { const r=__ve.root(); if(!r) return;

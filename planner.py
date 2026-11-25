@@ -96,6 +96,9 @@ def sentence_ends(part_text: str, duration: float, pauses: list[list[float]], sn
 def plan_scenes(parts: list[dict], target: float = 7.0, min_len: int = 3, max_len: int = 10) -> list[dict]:
     """parts: [{text, duration, pauses}] in order (narration placed back to back from 0).
     Returns scenes [{n, text, start, end, len, part}] with integer `len` summing to ceil(total)."""
+    max_len = max(1, min(int(max_len), 10))
+    min_len = max(1, min(int(min_len), max_len))
+    target = max(min_len, min(float(target), max_len))
     timeline: list[tuple[str, float, float, int]] = []  # sentence, start, end, part index
     offset = 0.0
     for k, p in enumerate(parts):
@@ -115,7 +118,7 @@ def plan_scenes(parts: list[dict], target: float = 7.0, min_len: int = 3, max_le
             if cur:
                 groups.append(cur)
                 cur = None
-            pieces = math.ceil(d / (target + 1))
+            pieces = math.ceil(d / max_len)
             step = d / pieces
             for i in range(pieces):
                 groups.append({"text": s, "start": a + i * step, "end": a + (i + 1) * step, "part": k,
@@ -123,7 +126,7 @@ def plan_scenes(parts: list[dict], target: float = 7.0, min_len: int = 3, max_le
             continue
         if cur is None:
             cur = {"text": s, "start": a, "end": b, "part": k}
-        elif (b - cur["start"]) <= max_len and (cur["end"] - cur["start"]) < target - 1.5:
+        elif k == cur["part"] and (b - cur["start"]) <= max_len and (cur["end"] - cur["start"]) < target - 1.5:
             cur["text"] += " " + s
             cur["end"] = b
         else:
@@ -137,12 +140,14 @@ def plan_scenes(parts: list[dict], target: float = 7.0, min_len: int = 3, max_le
     while i < len(groups):
         g = groups[i]
         if g["end"] - g["start"] < min_len and len(groups) > 1:
-            if i > 0 and groups[i]["end"] - groups[i - 1]["start"] <= max_len and "beat" not in groups[i - 1]:
+            if (i > 0 and groups[i]["part"] == groups[i - 1]["part"]
+                    and groups[i]["end"] - groups[i - 1]["start"] <= max_len and "beat" not in groups[i - 1]):
                 groups[i - 1]["text"] += " " + g["text"]
                 groups[i - 1]["end"] = g["end"]
                 groups.pop(i)
                 continue
-            if i + 1 < len(groups) and groups[i + 1]["end"] - g["start"] <= max_len and "beat" not in groups[i + 1]:
+            if (i + 1 < len(groups) and groups[i]["part"] == groups[i + 1]["part"]
+                    and groups[i + 1]["end"] - g["start"] <= max_len and "beat" not in groups[i + 1]):
                 groups[i + 1]["text"] = g["text"] + " " + groups[i + 1]["text"]
                 groups[i + 1]["start"] = g["start"]
                 groups.pop(i)
@@ -172,6 +177,108 @@ def plan_scenes(parts: list[dict], target: float = 7.0, min_len: int = 3, max_le
         sc["start"] = s
         s += sc["len"]
     return scenes
+
+
+def split_overlong_scenes(scenes: list[dict], max_len: int = 10) -> tuple[list[dict], int]:
+    """Split legacy scenes that exceed VideoExpress' per-clip duration limit."""
+    max_len = max(1, min(int(max_len), 10))
+    result: list[dict] = []
+    split_count = 0
+    media_keys = (
+        "img", "img_ok", "frame", "ref", "lib_id", "fileName", "preview",
+        "video_url", "dur_ms", "error", "submitted",
+    )
+
+    for scene in scenes:
+        duration = int(float(scene.get("len") or 0))
+        if duration <= max_len:
+            result.append(dict(scene))
+            continue
+
+        count = math.ceil(duration / max_len)
+        base, remainder = divmod(duration, count)
+        lengths = [base + (1 if index < remainder else 0) for index in range(count)]
+        original_start = float(scene.get("t_start", scene.get("start", 0)))
+        original_end = float(scene.get("t_end", original_start + duration))
+        elapsed = 0
+        split_count += 1
+
+        for index, length in enumerate(lengths):
+            piece = dict(scene)
+            piece["len"] = length
+            piece["beat"] = f"{scene.get('beat', '')} (segment {index + 1} of {count})".strip()
+            piece["status"] = "pending"
+            piece["tries"] = 0
+            if index:
+                piece["continue"] = True
+                piece.pop("line", None)
+                piece.pop("audio", None)
+                image_prompt = str(scene.get("image") or "").rstrip()
+                if image_prompt:
+                    piece["image"] = (
+                        f"{image_prompt} Continue the same scene in its next moment, "
+                        "preserving the characters, setting, and visual style."
+                    )
+            piece["t_start"] = round(
+                original_start + (original_end - original_start) * elapsed / duration, 2
+            )
+            elapsed += length
+            piece["t_end"] = round(
+                original_start + (original_end - original_start) * elapsed / duration, 2
+            )
+            for key in media_keys:
+                piece.pop(key, None)
+            result.append(piece)
+
+    start = 0
+    for index, scene in enumerate(result, start=1):
+        scene["n"] = index
+        scene["start"] = start
+        start += int(scene["len"])
+    return result, split_count
+
+
+def partition_narration_exports(parts: list[dict], scenes: list[dict], limit: float = 600) -> list[dict]:
+    """Group whole TTS parts and their scenes into exports no longer than the VideoExpress cap."""
+    groups: list[dict] = []
+    start = 0
+    seconds = 0.0
+    for i, part in enumerate(parts):
+        length = float(part.get("duration") or 0)
+        if length <= 0 or length > limit:
+            raise ValueError(f"Narration part {i + 1} must be between 0 and {limit:g} seconds to export.")
+        if seconds and seconds + length > limit:
+            groups.append({"part_start": start, "part_end": i, "duration_s": seconds})
+            start, seconds = i, 0.0
+        seconds += length
+    if seconds:
+        groups.append({"part_start": start, "part_end": len(parts), "duration_s": seconds})
+
+    for group in groups:
+        part_numbers = set(range(group["part_start"] + 1, group["part_end"] + 1))
+        group["scene_numbers"] = [scene["n"] for scene in scenes if scene.get("part") in part_numbers]
+        if not group["scene_numbers"]:
+            raise ValueError("A narration export segment has no matching scenes; re-plan the scenes before exporting.")
+    return groups
+
+
+def partition_scene_exports(scenes: list[dict], limit: float = 600) -> list[dict]:
+    """Group consecutive dialogue scenes into exports no longer than the VideoExpress cap."""
+    groups: list[dict] = []
+    current: list[int] = []
+    seconds = 0.0
+    for scene in scenes:
+        length = float(scene.get("len") or 0)
+        if length <= 0 or length > limit:
+            raise ValueError(f"Scene {scene.get('n')} must be between 0 and {limit:g} seconds to export.")
+        if seconds and seconds + length > limit:
+            groups.append({"scene_numbers": current, "duration_s": seconds})
+            current, seconds = [], 0.0
+        current.append(scene["n"])
+        seconds += length
+    if current:
+        groups.append({"scene_numbers": current, "duration_s": seconds})
+    return groups
 
 
 def expand(text: str, tokens: dict[str, str]) -> str:

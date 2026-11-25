@@ -7,6 +7,7 @@ import random
 import re
 import subprocess
 import sys
+import tempfile
 import wave
 from pathlib import Path
 
@@ -32,6 +33,39 @@ def duration(path: str | Path) -> float:
     err = _run(["-i", str(path)]).stderr
     m = re.search(r"Duration: (\d+):(\d+):([\d.]+)", err)
     return int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3)) if m else 0.0
+
+
+def concatenate(videos: list[Path], out: Path, log=print) -> Path:
+    """Join VideoExpress segments locally without re-encoding their video or audio."""
+    if len(videos) < 2 or any(not path.is_file() for path in videos):
+        raise RuntimeError("Joining requires at least two downloaded video segments.")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out.with_name(out.stem + ".joining" + out.suffix)
+    manifest_path = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", suffix=".ffconcat",
+                                         dir=out.parent, delete=False) as manifest:
+            manifest_path = Path(manifest.name)
+            for path in videos:
+                escaped = str(path.resolve()).replace("\\", "/").replace("'", "'\\''")
+                manifest.write(f"file '{escaped}'\n")
+        log(f"Joining {len(videos)} video segments with ffmpeg…")
+        result = _run(["-y", "-f", "concat", "-safe", "0", "-i", str(manifest_path),
+                       "-c", "copy", "-movflags", "+faststart", str(tmp)])
+        if result.returncode or not tmp.is_file():
+            raise RuntimeError("ffmpeg could not join the video segments: " + result.stderr[-600:])
+        expected = sum(duration(path) for path in videos)
+        actual = duration(tmp)
+        if expected <= 0 or actual <= 0 or abs(actual - expected) > 2:
+            raise RuntimeError(f"Joined video length ({actual:.1f}s) does not match the segments "
+                               f"({expected:.1f}s).")
+        tmp.replace(out)
+        return out
+    finally:
+        if manifest_path and manifest_path.exists():
+            manifest_path.unlink()
+        if tmp.exists():
+            tmp.unlink()
 
 
 def mean_volume(path: str | Path, seconds: float = 90) -> float:

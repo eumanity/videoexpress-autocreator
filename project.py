@@ -81,6 +81,11 @@ def read_keys_file() -> dict:
     return out
 _lock = threading.RLock()
 
+MAX_VIDEO_MINUTES = 18
+MAX_VIDEO_SECONDS = MAX_VIDEO_MINUTES * 60
+MAX_EXPORT_SEGMENT_SECONDS = 600
+MAX_VIDEO_CLIP_SECONDS = 10
+
 DEFAULT_SETTINGS = {
     "provider": "groq",              # groq | claude | gemini | manual | offline
     "groq_key": "",
@@ -120,6 +125,15 @@ DEFAULT_SETTINGS = {
 }
 
 
+def normalise_scene_bounds(settings: dict) -> dict:
+    """Keep scene timing settings within VideoExpress' per-clip limit."""
+    scene_max = max(1, min(int(settings.get("scene_max", 10)), MAX_VIDEO_CLIP_SECONDS))
+    scene_min = max(1, min(int(settings.get("scene_min", 3)), scene_max))
+    scene_target = max(scene_min, min(int(settings.get("scene_target", 7)), scene_max))
+    settings.update(scene_min=scene_min, scene_max=scene_max, scene_target=scene_target)
+    return settings
+
+
 def load_settings() -> dict:
     HOME.mkdir(parents=True, exist_ok=True)
     s = dict(DEFAULT_SETTINGS)
@@ -134,7 +148,7 @@ def load_settings() -> dict:
         s["gemini_model"] = DEFAULT_SETTINGS["gemini_model"]
     if s.get("provider") not in ("groq", "claude", "gemini", "manual", "offline"):
         s["provider"] = "groq"
-    return s
+    return normalise_scene_bounds(s)
 
 
 def save_settings(new: dict) -> dict:
@@ -150,6 +164,7 @@ def save_settings(new: dict) -> dict:
                 s[k] = float(v or 0)
             else:
                 s[k] = str(v)
+    normalise_scene_bounds(s)
     SETTINGS_FILE.write_text(json.dumps(s, indent=1), "utf-8")
     return s
 
@@ -213,7 +228,9 @@ class Project:
         st = self.state
         sc = st.get("scenes", [])
         return {"slug": self.slug, "name": st.get("name"), "stage": st.get("stage"), "scenes": len(sc),
-                "done": sum(1 for s in sc if s.get("status") == "done"), "created": st.get("created")}
+                "done": sum(1 for s in sc if s.get("status") == "done"),
+                "rendering": sum(1 for s in sc if s.get("status") == "rendering"),
+                "created": st.get("created")}
 
 
 _cache: dict[str, Project] = {}

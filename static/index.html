@@ -72,7 +72,7 @@ h1{font-size:22px;margin:0 0 4px}h2{font-size:16px;margin:22px 0 10px}.muted{col
   <input type="hidden" id="nType" value="narrated">
   <div class="grid2">
     <div><label>Topic / story idea (the AI writes the script or screenplay from this)</label><input id="nTopic" placeholder="e.g. The Battle of Blair Mountain, 1921  ·  A nurse in Lagos finds her missing father's letter" oninput="est()"></div>
-    <div class="row"><div class="grow"><label>Length (minutes)</label><input id="nMin" type="number" min="0.5" max="10" step="0.5" value="5" oninput="est()"></div>
+    <div class="row"><div class="grow"><label>Length (minutes, up to 18)</label><input id="nMin" type="number" min="0.5" max="18" step="0.5" value="5" oninput="est()"></div>
       <div class="grow"><label>Look</label><select id="nPreset"></select></div></div>
     <div><label>Video name (also the file name) - optional</label><input id="nName" placeholder="defaults to the topic"></div>
     <div><label>Extra notes for the AI - optional</label><input id="nNotes" placeholder="e.g. focus on the miners' side, end with a lesson, Nigerian setting"></div>
@@ -119,13 +119,13 @@ h1{font-size:22px;margin:0 0 4px}h2{font-size:16px;margin:22px 0 10px}.muted{col
     <div><label>Dialogue voices</label><select id="s_dialogue_voice_mode"><option value="exact">Exact voices I pick + lip-sync (recommended)</option><option value="ai">Let the video AI voice the lines (from each voice description)</option></select></div>
     <div><label>Default look</label><select id="s_preset" onchange="presetType()"></select></div>
     <div><label>VideoExpress image type value <span id="typesHint"></span></label><input id="s_image_type" list="typeList"><datalist id="typeList"></datalist></div>
-    <div><label>Target scene length (s)</label><input id="s_scene_target" type="number"></div>
-    <div class="row"><div class="grow"><label>Min (s)</label><input id="s_scene_min" type="number"></div><div class="grow"><label>Max (s)</label><input id="s_scene_max" type="number"></div></div>
+    <div><label>Target scene length (s)</label><input id="s_scene_target" type="number" min="1" max="10"></div>
+    <div class="row"><div class="grow"><label>Min (s)</label><input id="s_scene_min" type="number" min="1" max="10"></div><div class="grow"><label>Max (s; VideoExpress limit 10)</label><input id="s_scene_max" type="number" min="1" max="10"></div></div>
     <div><label>Renders in parallel (VideoExpress allows 5)</label><input id="s_max_parallel" type="number"></div>
     <div><label>Budget: max clips per video (stops and asks above this)</label><input id="s_max_clips" type="number"></div>
     <div><label>Retries per failed scene</label><input id="s_image_retries" type="number"></div>
     <div><label>Narrator speed for estimates (words/min)</label><input id="s_wpm" type="number"></div>
-    <div><label>Export limit (seconds)</label><input id="s_export_cap_seconds" type="number"></div>
+    <div><label>VideoExpress export segment limit (seconds, max 600)</label><input id="s_export_cap_seconds" type="number" min="1" max="600"></div>
     <div><label>Save finished videos to</label><input id="s_download_dir"></div>
   </div>
   <h2>Music &amp; sound effects (step 7)</h2>
@@ -147,7 +147,7 @@ h1{font-size:22px;margin:0 0 4px}h2{font-size:16px;margin:22px 0 10px}.muted{col
 
 <script>
 const $=s=>document.querySelector(s), esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-let S={}, presets={}, ptypes={}, cur=null, P=null, tab='scenes', st={}, sceneFilter='all';
+let S={}, presets={}, ptypes={}, cur=null, P=null, tab='scenes', st={}, sceneFilter='all', rewriteEnabled=false;
 const STAGES=['new','analysed','narrated','planned','prompted','rendered','exported','mixed'];
 const STEPS=[['analyse','1 · Study script','analysed'],['narrate','2 · Narration','narrated'],['plan','3 · Scene timing','planned'],
   ['prompts','4 · Write prompts','prompted'],['render','5 · Render clips','rendered'],['assemble','6 · Edit & export','exported'],['sound','7 · Music & SFX','mixed']];
@@ -159,7 +159,7 @@ async function boot(){const j=await api('/api/settings'); S=j.settings; presets=
   const opts=Object.entries(presets).map(([k,v])=>`<option value="${k}">${v}</option>`).join(''); $('#nPreset').innerHTML=opts; $('#s_preset').innerHTML=opts;
   await loadList(); const l=await api('/api/projects'); if(l.length) select(l[0].slug); else renderEmpty(); setInterval(tick,1500)}
 async function loadList(){const l=await api('/api/projects');
-  $('#plist').innerHTML=l.map(p=>`<div class="pitem ${p.slug===cur?'on':''}" onclick="select('${p.slug}')"><b>${esc(p.name)}</b><small>${p.stage}${p.scenes?` · ${p.done}/${p.scenes} clips`:''}</small></div>`).join('')||'<p class="muted" style="padding:10px">No videos yet.</p>'}
+  $('#plist').innerHTML=l.map(p=>`<div class="pitem ${p.slug===cur?'on':''}" onclick="select('${p.slug}')"><b>${esc(p.name)}</b><small>${p.stage}${p.scenes?` · ${p.done}/${p.scenes} done${p.rendering?` · ${p.rendering} rendering`:''}`:''}</small></div>`).join('')||'<p class="muted" style="padding:10px">No videos yet.</p>'}
 function renderEmpty(){$('#main').innerHTML=`<div class="empty"><div><h1>Paste a script, get a finished video.</h1><p class="muted">VideoExpress AutoCreator studies your script, generates the narration in VideoExpress,<br>times every scene to the voice, writes the image and motion prompts, renders, edits and exports.</p>
   <button class="pri" onclick="showNew()">＋ New video</button> <button onclick="openSettings()">⚙ Settings</button>
   <div class="log" id="logBox" style="margin-top:20px;text-align:left;height:220px">${esc((st.log||[]).join('\n'))}</div></div></div>`}
@@ -170,7 +170,7 @@ function setType(t){$('#nType').value=t; document.querySelectorAll('.tbtn').forE
 function est(){const ty=$('#nType').value, own=$('#nScript').value.trim(), m=+$('#nMin').value||5;
   const w=(own.match(/\b\w[\w'’-]*\b/g)||[]).length;
   if(ty==='narrated'){ const sec=own?w/(S.wpm||165)*60:m*60, sc=Math.round(sec/(S.scene_target||7));
-    $('#nEst').innerHTML=(own?`${w} words of your script · `:'AI writes ≈ '+Math.round(m*(S.wpm||165))+' words · ')+`≈ ${(sec/60).toFixed(1)} min · ≈ ${sc} scenes (${sc} images + ${sc} clips)${sec>S.export_cap_seconds?' · <b style="color:var(--warn)">longer than the 10-min export limit</b>':''}`; return}
+    $('#nEst').innerHTML=(own?`${w} words of your script · `:'AI writes ≈ '+Math.round(m*(S.wpm||165))+' words · ')+`≈ ${(sec/60).toFixed(1)} min · ≈ ${sc} scenes (${sc} images + ${sc} clips)${sec>1080?' · <b style="color:var(--warn)">over the 18-minute maximum</b>':sec>600?' · exports in parts and joins automatically':''}`; return}
   const n=Math.round(m*60/6.5); $('#nEst').innerHTML=`🎬 Movie mode: the AI writes the screenplay, every character gets their own voice and talks on screen (lip-synced). ≈ ${n} shots · new keyframes only when the scene changes, the rest continue from the last frame.`}
 async function createProject(){const body={name:$('#nName').value,preset:$('#nPreset').value,script:$('#nScript').value,story_type:$('#nType').value,
   minutes:+$('#nMin').value||5, topic:$('#nTopic').value, reference:$('#nRef').value, notes:$('#nNotes').value, start:$('#nStart').checked};
@@ -189,12 +189,12 @@ function render(){const si=stageIdx(P.stage), busy=st.busy, a=P.analysis||{}, sc
   const DLG=P.story_type==='dialogue'||P.story_type==='both';
   const LBL=DLG?{analyse:'1 · Screenplay',narrate:'2 · Voices',plan:'3 · Shot timing',prompts:'4 · Shot prompts'}:{};
   h+='<div class="steps">'+STEPS.map(([k,t0,need],i)=>{const t=LBL[k]||t0;const isDone=si>=stageIdx(need); const next=!isDone&&si>=stageIdx(need)-1;
-     let sub=isDone?'done':(next?'ready':'waiting'); if(k==='render'&&sc.length) sub=`${done}/${sc.length} clips`; if(k==='narrate'&&!DLG&&P.parts?.length) sub=`${P.parts.filter(x=>x.audio).length}/${P.parts.length} parts`; if(k==='narrate'&&DLG&&sc.length){const L=sc.filter(x=>x.line); sub=`${L.filter(x=>x.audio).length}/${L.length} lines`}
+     let sub=isDone?'done':(next?'ready':'waiting'); if(k==='render'&&sc.length){const active=sc.filter(x=>x.status==='rendering').length; sub=`${done}/${sc.length} done${active?` · ${active} rendering`:''}`} if(k==='narrate'&&!DLG&&P.parts?.length) sub=`${P.parts.filter(x=>x.audio).length}/${P.parts.length} parts`; if(k==='narrate'&&DLG&&sc.length){const L=sc.filter(x=>x.line); sub=`${L.filter(x=>x.audio).length}/${L.length} lines`}
      return `<div class="step ${isDone?'done':''} ${next?'cur':''}"><div class="t">${t}</div><div class="s">${sub}</div><button ${busy||(!isDone&&!next)?'disabled':''} onclick="run('${k}')">${isDone?'Redo':'Run'}</button></div>`}).join('')+'</div>';
   if(P.manual) h+=manualBox();
   if(sc.length && P.budget_ok===false) h+=`<div class="banner"><div class="grow">⚠ ${sc.length} clips is above your budget limit of ${S.max_clips}. Approve to continue, or shorten the script.</div><button class="pri" onclick="approveBudget()">Approve ${sc.length} clips</button></div>`;
   if(P.export?.final) h+=`<div class="card" style="border-color:#14532d">🎵 <b>Final video with music &amp; sound effects:</b> <code>${esc(P.export.final)}</code></div>`;
-  if(P.export?.file) h+=`<div class="card" style="border-color:#14532d">✔ <b>Exported.</b> Saved to <code>${esc(P.export.file)}</code> (${(P.export.duration_s/60||0).toFixed(2)} min). Also saved in VideoExpress as “${esc(P.export_name||P.name)}”.</div>`;
+  if(P.export?.file) h+=`<div class="card" style="border-color:#14532d">✔ <b>Exported.</b> Saved to <code>${esc(P.export.file)}</code> (${(P.export.duration_s/60||0).toFixed(2)} min). ${P.export.stitched?`Joined from ${P.export.segments?.length||0} exports on this PC.`:`Also saved in VideoExpress as “${esc(P.export_name||P.name)}”.`}</div>`;
   h+=`<div class="tabs">${((P.story_type||'narrated')!=='narrated'?['scenes','characters','bible','sound','seo','script','log']:['scenes','bible','sound','seo','script','log']).map(t=>`<div class="tab ${tab===t?'on':''}" onclick="tab='${t}';render()">${{scenes:'Scenes',characters:'Characters & voices',bible:'Visual bible',sound:'Music & SFX',seo:'YouTube SEO',script:'Script & narration',log:'Log'}[t]}</div>`).join('')}
      <div class="grow"></div><a href="/api/project/${cur}/pack.txt" style="color:var(--acc);align-self:center;padding:0 8px">⬇ Prompt pack (.txt)</a></div>`;
   h+=`<div id="tabBody">${tabBody()}</div>`;
@@ -238,6 +238,7 @@ function tabBody(){const a=P.analysis||{}, sc=P.scenes||[];
        <div class="grid2"><div><label>Video setting</label><input id="cx${s.n}" value="${esc(s.ctx||'')}"></div>
        <div><label>Shots (CAMERA: action, one per line)</label><textarea rows="2" id="sh${s.n}">${esc((s.shots||[]).map(x=>x.camera+': '+x.action).join('\n'))}</textarea></div></div>
        <div class="row" style="margin-top:6px"><button onclick="saveScene(${s.n},false)">Save</button><button onclick="saveScene(${s.n},true)" title="Discard this scene's keyframe/clip and render it again">Save & redo scene</button>
+       <button ${st.busy||s.continue||!rewriteEnabled?'disabled':''} onclick="rewriteScene(${s.n})" title="${s.continue?'This scene continues from the previous clip and has no separate image prompt':rewriteEnabled?'Rewrite this image prompt with AI':'Restart the app to enable AI prompt rewriting'}">✨ Rewrite prompt</button>
        <details class="grow"><summary class="muted" style="cursor:pointer">final prompts</summary><div class="muted" style="white-space:pre-wrap;font-size:12px">${esc(s.full_image||'')}\n\n${esc(s.full_video||'')}</div></details></div></div></div>`).join('')}
 
 const MOODS=['tense','dark','epic','sad','hopeful','mysterious','calm','reverent'];
@@ -269,6 +270,8 @@ async function saveScene(n,redo){const shots=$('#sh'+n).value.split('\n').map(l=
   const body={image:$('#im'+n).value,ctx:$('#cx'+n).value,shots,redo};
   if($('#ln'+n)){body.line=$('#ln'+n).value; body.delivery=$('#dl'+n).value; body.continue=$('#co'+n).checked}
   await api(`/api/project/${cur}/scene/${n}`,body); await refresh()}
+async function rewriteScene(n){const feedback=prompt('What should be different in the image? Leave blank for the AI to decide.'); if(feedback===null)return;
+  await api(`/api/project/${cur}/scene/${n}/rewrite`,{feedback}); tab='log'; await refresh(); tick()}
 function scriptTab(){const f=P.formula, locked=stageIdx(P.stage)>=stageIdx('narrated');
   return `<div class="card"><div class="row"><b class="grow">Script ${P.script_ai?'<span class="badge done">written by AI</span>':''}</b>
     ${P.topic&&!locked?`<button ${st.busy?'disabled':''} onclick="if(confirm('Write a new script for: ${esc(P.topic).replace(/'/g,'')}?')) run('script')">✨ ${P.script?'Rewrite':'Write'} with AI</button>`:''}
@@ -317,7 +320,7 @@ function presetType(){const t=ptypes[$('#s_preset').value]; if(t) $('#s_image_ty
 async function saveSettings(keepOpen){const o={}; for(const k of Object.keys(S)){const e=$('#s_'+k); if(e) o[k]=e.type==='number'?Number(e.value):e.value}
   const j=await api('/api/settings',o); S=j.settings; aiStatus(); if(!keepOpen) hide('mSet')}
 async function openKeys(){await api('/api/open_keys',{}); alert('The keys file opened in Notepad. Paste your keys after the = signs, press Ctrl+S, then close and reopen VideoExpress AutoCreator.')}
-async function aiStatus(){try{const v=await api('/api/version'); $('#ver').textContent='v'+v.version;
+async function aiStatus(){try{const v=await api('/api/version'); $('#ver').textContent='v'+v.version; rewriteEnabled=!!v.scene_rewrite;
   $('#aiStatus').innerHTML=`AI: <b>${esc(v.provider)}</b>${v.model?` · ${esc(v.model)}`:''}<br>${v.has_key?'<span style="color:var(--ok)">key found ✔</span>':'<span style="color:var(--bad)">no key - click to add</span>'}`}catch(e){}}
 async function testAI(){$('#aiTest').textContent='Testing…'; await saveSettings(true);
   try{const r=await fetch('/api/test_ai',{method:'POST'}); const j=await r.json(); $('#aiTest').textContent=j.message||('✖ '+j.error)}catch(e){$('#aiTest').textContent='✖ '+e}}

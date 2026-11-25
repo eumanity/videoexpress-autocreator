@@ -8,7 +8,7 @@ from flask import Flask, Response, jsonify, request, send_from_directory
 from . import pipeline as PL
 from . import planner as P
 from .brain import STYLE_PRESETS, build_image_prompt, build_video_prompt
-from .project import Project, list_projects, load_settings, open_project, save_settings
+from .project import MAX_VIDEO_MINUTES, Project, list_projects, load_settings, open_project, save_settings
 
 STATIC = Path(__file__).parent / "static"
 app = Flask(__name__, static_folder=None)
@@ -62,7 +62,8 @@ def version():
     s = load_settings()
     return jsonify({"version": __version__, "provider": s["provider"],
                     "model": s.get({"groq": "groq_model", "gemini": "gemini_model", "claude": "claude_model"}.get(s["provider"], ""), ""),
-                    "has_key": bool(s.get({"groq": "groq_key", "gemini": "gemini_key", "claude": "anthropic_key"}.get(s["provider"], "x"), "ok"))})
+                    "has_key": bool(s.get({"groq": "groq_key", "gemini": "gemini_key", "claude": "anthropic_key"}.get(s["provider"], "x"), "ok")),
+                    "scene_rewrite": True})
 
 
 @app.post("/api/open_keys")
@@ -105,7 +106,7 @@ def new_project():
     p.state["topic"] = topic
     p.state["reference"] = (d.get("reference") or "").strip()
     p.state["notes"] = (d.get("notes") or "").strip()
-    p.state["minutes"] = max(0.5, min(10.0, float(d.get("minutes") or 3)))
+    p.state["minutes"] = max(0.5, min(float(MAX_VIDEO_MINUTES), float(d.get("minutes") or 3)))
     p.state["estimate_s"] = (round(P.estimate_seconds(P.clean_script(script), load_settings()["wpm"]))
                              if p.state["story_type"] == "narrated" and script else int(p.state["minutes"] * 60))
     p.save()
@@ -201,6 +202,22 @@ def edit_scene(slug, n):
             p.state["stage"] = "prompted"
     p.save()
     return jsonify({"ok": True})
+
+
+@app.post("/api/project/<slug>/scene/<int:n>/rewrite")
+def rewrite_scene_prompt(slug, n):
+    p = _proj(slug)
+    if PL.RUN.busy:
+        raise RuntimeError("Another job is running. Stop it first.")
+    sc = next((s for s in p.state.get("scenes", []) if s["n"] == n), None)
+    if sc is None:
+        raise ValueError(f"Scene {n} was not found.")
+    if sc.get("status") == "rendering":
+        raise ValueError("This scene is rendering right now.")
+    d = request.json or {}
+    feedback = str(d.get("feedback", "")).strip()[:1000]
+    PL.RUN.start("rewrite scene prompt", p, lambda: PL.step_rewrite_scene_prompt(p, n, feedback))
+    return jsonify({"started": True})
 
 
 @app.get("/api/music_files")
